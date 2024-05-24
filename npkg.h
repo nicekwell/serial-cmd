@@ -1,19 +1,4 @@
-
-这是一个把单字节数据流封装成 数据包(npkg) 或 指令包(ncmd) 的模块。  
-单字节数据流在进行通信时不方便制定协议，本模块封装了：
-
-* 数据包：即有序数据列表，类似于udp协议传输的数据包。
-* 指令包：基于数据包再次封装，形成 cmd + data 形式的包。
-
-基本工作方式是：
-1. 发送过程：  
-   调用本模块的send接口，传入数据包或指令包。  
-   本模块会对数据重新编码，对外输出编码后的单字节数据流。
-2. 接收过程：  
-   把接收到的单字节数据流送到本模块的接口函数，本模块解析到合法的数据包或指令包后，  
-   会还原原始数据包或指令包内容，并通过回调函数输出。
-
-```c
+/*
 这是一个把单字节数据流封装成 数据包(npkg) 或 指令包(ncmd) 的模块。
 单字节数据流在进行通信时不方便制定协议，本模块封装了：
 * 数据包：即有序数据列表，类似于udp协议传输的数据包。
@@ -152,5 +137,93 @@
                    ！！！如果cmd:dat里恰好出现 esc+head、esc+dat、esc+head 组合时，则会导致数据出错，其他情况都没问题。
                    本模块默认esc设置得比较长就会降低数据里出现esc的概率。
                    宽松发送的好处是对于不使用本模块的人也可以很方便地发送数据给本模块。  
-```
+ */
+#ifndef __NPKG_H__
+#define __NPKG_H__
 
+#include <stdint.h>
+
+#define NPKG_ESC_MAX_LEN        (10)    //转义字符的最大长度
+
+typedef enum {
+    NPKG_CRC_OFF = 0,
+    NPKG_CRC_ON
+} npkg_crc_t;
+
+typedef struct npkg {
+    /* 平台接口 */
+    void (*npkg_serial_send)(uint8_t *dat, uint16_t len);    //发送数据接口
+    /* 模块接口 */
+    void (*npkg_callback)(uint8_t *dat, uint16_t len, void *args);
+    void *args;
+    /* 协议数据结构 */
+    //转义字符
+    uint8_t esc[NPKG_ESC_MAX_LEN];     //转义字符
+    uint8_t esc_len;       //转义字符长度
+    uint8_t head, dat, end;
+    //crc功能
+    npkg_crc_t flag_crc;   //默认打开。打开的话则会在数据包增加2字节作为CRC
+    //buf
+    uint8_t *send_buf;    //发送buf
+    uint16_t send_buf_size;
+    uint16_t send_buf_len;              //send_buf里当前有效数据量
+    uint8_t *recv_buf;    //接收到的数据包buf
+    uint16_t recv_buf_size;
+    uint16_t recv_buf_len;              //当前接收到的数据长度
+    //逻辑变量
+    uint8_t esc_step;       /* 0-CU: 没检测到ESC，当前等待ESC。EC：检测到esc。ED：
+                               1-CU：当前检测到了ESC，当前等待ESC后的数据
+                                  EC1：接收到了head
+                                  EC2：接收到了dat
+                                  EC3：接收到了end
+                         */
+    uint8_t esc_i;      //用于esc计数
+    uint8_t flag_recv_data;  //标志当前是否保存数据，1-是，0-否
+} npkg_t;
+npkg_t *npkg_alloc(uint16_t recv_buf_size,
+                   uint16_t send_buf_size,
+                   void (*npkg_serial_send)(uint8_t *dat, uint16_t len),
+                   void (*npkg_callback)(uint8_t *dat, uint16_t len, void *args),
+                   void *args);
+npkg_t *npkg_alloc_static(uint8_t *handle_buf,  //大小应当等于sizeof(npkg_t)
+                          uint8_t *recv_buf, uint16_t recv_buf_size,
+                          uint8_t *send_buf, uint16_t send_buf_size,
+                          void (*npkg_serial_send)(uint8_t *dat, uint16_t len),
+                          void (*npkg_callback)(uint8_t *dat, uint16_t len, void *args),
+                          void *args);
+void npkg_free(npkg_t *handle);
+uint16_t npkg_send(npkg_t *handle, uint8_t *dat, uint16_t len); //发送一个数据包，返回实际发送的数据量
+void npkg_get_byte(npkg_t *handle, uint8_t get);
+void npkg_get_buf(npkg_t *handle, uint8_t *dat, uint16_t len);
+
+
+typedef struct ncmd {
+    /* 继承 */
+    npkg_t *npkg;
+    /* 模块接口 */
+    void (*ncmd_callback)(uint16_t cmd, uint8_t *dat, uint16_t len, void *args);
+    void *args;
+    //buf
+    uint8_t *cmdbuf;    //用来重新把cmd包整理成pkg包
+    uint16_t cmdbuf_size;
+} ncmd_t;
+ncmd_t *ncmd_alloc(uint16_t recv_buf_size,
+                   uint16_t send_buf_size,      //会申请2个send_buf_size的缓存，一个cmd层，一个pkg层
+                   void (*ncmd_serial_send)(uint8_t *dat, uint16_t len),
+                   void (*ncmd_callback)(uint16_t cmd, uint8_t *dat, uint16_t len, void *args),
+                   void *args);
+ncmd_t *ncmd_alloc_static(uint8_t *cmd_handle_buf,      //cmd的handle buf，大小等于sizeof(ncmd_t)
+                          uint8_t *pkg_handle_buf,      //pkg的handle buf，大小等于sizeof(npkg_t)
+                          uint8_t *recv_buf, uint16_t recv_buf_size,
+                          uint8_t *send_buf_2, uint16_t send_buf_size,  //需要两倍send_buf_size的内存，一个用于cmd层，一个用于pkg层
+                          void (*ncmd_serial_send)(uint8_t *dat, uint16_t len),
+                          void (*ncmd_callback)(uint16_t cmd, uint8_t *dat, uint16_t len, void *args),
+                          void *args);
+                          
+void ncmd_free(ncmd_t *handle);
+uint16_t ncmd_send(ncmd_t *handle, uint16_t cmd, uint8_t *dat, uint16_t len);   //发送cmd
+void ncmd_get_byte(ncmd_t *handle, uint8_t dat);
+void ncmd_get_buf(ncmd_t *handle, uint8_t *dat, uint16_t len);
+
+
+#endif
